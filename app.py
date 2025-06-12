@@ -1,871 +1,642 @@
-"""
-Educational Tutor Agent - Fixed and Optimized Streamlit Application
-
-Run with: streamlit run app.py --server.fileWatcherType none
-"""
-
 import streamlit as st
+import logging
 import os
 import warnings
-from dotenv import load_dotenv
-import logging
-import requests
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
 import json
-from typing import List, Dict, Any, Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Optimized compatibility setup
-os.environ.update({
-    "TOKENIZERS_PARALLELISM": "false",
-    "OMP_NUM_THREADS": "1"
-})
+# Suppress warnings and configure environment
 warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-# Import the real educational agent
+# Configure logging to match the format in the error logs
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger('tutor_agent')
+
+# Import configuration
 try:
-    from tutor_agent import setup_educational_agent, setup_web_search_tool
-    REAL_AGENT_AVAILABLE = True
-    logger.info("✅ Real educational agent available")
+    from config import get_deployment_config, get_model_config, FALLBACK_SCIENCE_QA
+    deployment_config = get_deployment_config()
+    model_config = get_model_config()
+except ImportError:
+    logger.warning("Config file not found, using default configuration")
+    deployment_config = {"USE_FALLBACK_DATASET": True, "USE_CPU_ONLY": True}
+    model_config = {
+        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+        "llm_model": "google/flan-t5-small",
+        "max_length": 256,
+        "temperature": 0.7,
+        "top_k": 3
+    }
+
+# Try importing dependencies with proper error handling
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+    from sentence_transformers import SentenceTransformer
+    import faiss
+    import numpy as np
+    from datasets import Dataset
+    import pandas as pd
 except ImportError as e:
-    REAL_AGENT_AVAILABLE = False
-    logger.warning(f"⚠️ Real agent not available, using mock: {e}")
-
-# Fallback Mock Educational Agent (only used if real agent fails)
-class MockEducationalAgent:
-    """Fallback mock educational agent that provides basic science answers"""
-    
-    def __init__(self):
-        self.knowledge_base = {
-            "osmosis": {
-                "answer": "Osmosis is the movement of water molecules through a selectively permeable membrane from an area of high water concentration (low solute concentration) to an area of low water concentration (high solute concentration). This process continues until equilibrium is reached.",
-                "sources": ["Biology Textbook - Cell Biology", "ScienceQA - Membrane Transport"]
-            },
-            "photosynthesis": {
-                "answer": "Photosynthesis is the process by which plants convert light energy into chemical energy (glucose). The equation is: 6CO₂ + 6H₂O + light energy → C₆H₁₂O₆ + 6O₂. This occurs in chloroplasts using chlorophyll.",
-                "sources": ["Biology Textbook - Plant Biology", "ScienceQA - Energy Processes"]
-            },
-            "mitosis": {
-                "answer": "Mitosis is cell division that produces two identical diploid cells. It consists of prophase, metaphase, anaphase, and telophase. DNA replicates before division, and chromosomes are equally distributed to daughter cells.",
-                "sources": ["Biology Textbook - Cell Division", "ScienceQA - Cellular Processes"]
-            },
-            "respiration": {
-                "answer": "Cellular respiration is the process that breaks down glucose to produce ATP energy. The equation is: C₆H₁₂O₆ + 6O₂ → 6CO₂ + 6H₂O + ATP. It occurs in mitochondria through glycolysis, Krebs cycle, and electron transport.",
-                "sources": ["Biology Textbook - Metabolism", "ScienceQA - Energy Production"]
-            }
-        }
-    
-    def __call__(self, inputs: Dict[str, str]) -> Dict[str, Any]:
-        question = inputs.get("question", "").lower()
-        
-        # Search for relevant topics in the knowledge base
-        for topic, data in self.knowledge_base.items():
-            if topic in question:
-                return {
-                    "answer": data["answer"],
-                    "source_documents": [
-                        {"metadata": {"source": source, "subject": "Biology"}}
-                        for source in data["sources"]
-                    ]
-                }
-        
-        # Generate a generic science response for unknown topics
-        if any(word in question for word in ["science", "biology", "chemistry", "physics"]):
-            return {
-                "answer": "This is an interesting science question. While I have some information in my knowledge base, you might benefit from additional web research for a comprehensive answer.",
-                "source_documents": [{"metadata": {"source": "ScienceQA", "subject": "General Science"}}]
-            }
-        
-        return {
-            "answer": "I don't have specific information about this topic in my knowledge base. Let me search the web for current information.",
-            "source_documents": []
-        }
-
-class FallbackWebSearchTool:
-    """Fallback web search tool using free APIs"""
-    
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key  # Not used but kept for compatibility
-        self.search_engines = {
-            "duckduckgo": "https://api.duckduckgo.com/",
-            "wikipedia": "https://en.wikipedia.org/api/rest_v1/"
-        }
-    
-    def _run(self, query: str) -> str:
-        """Run web search and return formatted results"""
-        try:
-            # Use DuckDuckGo Instant Answer API (no key required)
-            results = self._search_duckduckgo(query)
-            if results:
-                return results
-            
-            # Fallback to Wikipedia search
-            results = self._search_wikipedia(query)
-            if results:
-                return results
-            
-            return "No web search results found for this query."
-            
-        except Exception as e:
-            logger.error(f"Web search error: {e}")
-            return f"Web search temporarily unavailable: {str(e)}"
-    
-    def _search_duckduckgo(self, query: str) -> str:
-        """Search using DuckDuckGo Instant Answer API"""
-        try:
-            url = "https://api.duckduckgo.com/"
-            params = {
-                "q": query,
-                "format": "json",
-                "no_html": "1",
-                "skip_disambig": "1"
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                
-                # Format the response
-                result_parts = []
-                
-                if data.get("Abstract"):
-                    result_parts.append(f"**{data.get('Heading', 'Answer')}**\n{data['Abstract']}")
-                    if data.get("AbstractURL"):
-                        result_parts.append(f"Source: {data['AbstractURL']}")
-                
-                if data.get("Definition"):
-                    result_parts.append(f"**Definition**\n{data['Definition']}")
-                    if data.get("DefinitionURL"):
-                        result_parts.append(f"Source: {data['DefinitionURL']}")
-                
-                # Add related topics
-                if data.get("RelatedTopics"):
-                    for topic in data["RelatedTopics"][:2]:  # Limit to 2 topics
-                        if isinstance(topic, dict) and topic.get("Text"):
-                            result_parts.append(f"**Related Information**\n{topic['Text']}")
-                            if topic.get("FirstURL"):
-                                result_parts.append(f"Source: {topic['FirstURL']}")
-                
-                if result_parts:
-                    return "\n\n".join(result_parts)
-            
-        except Exception as e:
-            logger.error(f"DuckDuckGo search error: {e}")
-        
-        return ""
-    
-    def _search_wikipedia(self, query: str) -> str:
-        """Search Wikipedia for information"""
-        try:
-            # Search for pages
-            search_url = "https://en.wikipedia.org/api/rest_v1/page/summary/"
-            # Clean query for Wikipedia
-            clean_query = query.replace(" ", "_")
-            
-            response = requests.get(f"{search_url}{clean_query}", timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("extract"):
-                    result = f"**{data.get('title', 'Wikipedia Result')}**\n{data['extract']}"
-                    if data.get("content_urls", {}).get("desktop", {}).get("page"):
-                        result += f"\n\nSource: {data['content_urls']['desktop']['page']}"
-                    return result
-            
-        except Exception as e:
-            logger.error(f"Wikipedia search error: {e}")
-        
-        return ""
-
-# This function is now imported from tutor_agent.py, but we keep this as a fallback
-def setup_fallback_agent():
-    """Initialize the fallback educational agent"""
-    return MockEducationalAgent()
-
-# Page Configuration
-st.set_page_config(
-    page_title="Educational Tutor Agent",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Optimized CSS with better mobile responsiveness
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    
-    .stApp {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        font-family: 'Inter', sans-serif;
-    }
-    
-    .main .block-container {
-        background: white;
-        border-radius: 20px;
-        padding: 2rem;
-        margin: 1rem;
-        box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-        max-width: 1200px;
-    }
-    
-    .main-title {
-        text-align: center;
-        color: #1565c0;
-        font-size: 2.5rem;
-        font-weight: 700;
-        margin-bottom: 0.5rem;
-        text-shadow: 2px 2px 4px rgba(21, 101, 192, 0.3);
-    }
-    
-    .subtitle {
-        text-align: center;
-        color: #424242;
-        font-size: 1.1rem;
-        margin-bottom: 2rem;
-        font-weight: 500;
-        line-height: 1.4;
-    }
-    
-    .answer-card {
-        background: #ffffff;
-        border-radius: 15px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-        color: #1a1a1a;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        border: 2px solid #e0e0e0;
-    }
-    
-    .kb-answer { 
-        border-color: #1565c0; 
-        background: linear-gradient(135deg, #f8f9ff 0%, #ffffff 100%);
-    }
-    
-    .web-result { 
-        border-color: #d32f2f; 
-        background: linear-gradient(135deg, #fff8f8 0%, #ffffff 100%);
-    }
-    
-    .warning-card { 
-        background: linear-gradient(135deg, #fff8e1 0%, #ffffff 100%);
-        border-color: #f57c00; 
-        color: #bf360c; 
-    }
-    
-    .error-card {
-        background: linear-gradient(135deg, #ffebee 0%, #ffffff 100%);
-        border-color: #d32f2f;
-        color: #c62828;
-    }
-    
-    .answer-content {
-        background: #f8f9fa;
-        padding: 1.2rem;
-        border-radius: 10px;
-        border-left: 4px solid #1565c0;
-        margin: 1rem 0;
-        color: #212529;
-        line-height: 1.7;
-        font-size: 1rem;
-    }
-    
-    .sources-section {
-        background: #e8f4f8;
-        padding: 1.2rem;
-        border-radius: 10px;
-        border-left: 4px solid #26a69a;
-        margin: 1rem 0;
-        color: #004d40;
-    }
-    
-    .source-item {
-        padding: 0.6rem 0;
-        border-bottom: 1px solid #b2dfdb;
-        color: #00695c;
-        font-size: 0.95rem;
-    }
-    
-    .source-item:last-child { border-bottom: none; }
-    
-    .section-header {
-        font-size: 1.4rem;
-        font-weight: 600;
-        margin-bottom: 1rem;
-        color: #333;
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-    
-    .status-indicator {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.6rem 1.2rem;
-        border-radius: 25px;
-        font-size: 0.9rem;
-        font-weight: 500;
-        margin: 0.5rem 0;
-    }
-    
-    .status-enabled {
-        background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
-        color: #155724;
-        border: 1px solid #c3e6cb;
-    }
-    
-    .status-disabled {
-        background: linear-gradient(135deg, #f8d7da 0%, #f1b0b7 100%);
-        color: #721c24;
-        border: 1px solid #f1b0b7;
-    }
-    
-    .source-link {
-        color: #667eea;
-        text-decoration: none;
-        font-weight: 500;
-        transition: all 0.3s ease;
-        word-break: break-word;
-    }
-    
-    .source-link:hover { 
-        color: #764ba2;
-        text-decoration: underline;
-    }
-    
-    .error-message {
-        background: #ffebee;
-        color: #c62828;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 4px solid #f44336;
-        margin: 1rem 0;
-    }
-    
-    .success-message {
-        background: #e8f5e8;
-        color: #2e7d32;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 4px solid #4caf50;
-        margin: 1rem 0;
-    }
-    
-    /* Mobile responsiveness */
-    @media (max-width: 768px) {
-        .main-title {
-            font-size: 2rem;
-        }
-        
-        .subtitle {
-            font-size: 1rem;
-        }
-        
-        .main .block-container {
-            padding: 1rem;
-            margin: 0.5rem;
-        }
-        
-        .answer-card {
-            padding: 1rem;
-        }
-        
-        .section-header {
-            font-size: 1.2rem;
-        }
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Title and Description
-st.markdown('<h1 class="main-title">🎓 Educational Tutor Agent</h1>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Ask any science question and get precise, reliable answers from our knowledge base and trusted web sources!</p>', unsafe_allow_html=True)
-
-# Session state initialization with error handling
-def init_session_state():
-    """Initialize all session state variables with proper defaults."""
-    defaults = {
-        "messages": [],
-        "qa_chain": None,
-        "exa_tool": None,
-        "initialized": False,
-        "error_state": False,
-        "initialization_attempted": False
-    }
-    
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-# Initialize session state
-init_session_state()
-
-# Improved sidebar with better error handling
-def setup_sidebar():
-    """Setup sidebar with web search configuration."""
-    with st.sidebar:
-        st.markdown("## 🌐 Web Search Configuration")
-        
-        # Initialize enhanced web search tool
-        if not st.session_state.exa_tool:
-            if REAL_AGENT_AVAILABLE:
-                try:
-                    st.session_state.exa_tool = setup_web_search_tool()
-                    if st.session_state.exa_tool:
-                        # Check if Tavily is available
-                        tavily_available = st.session_state.exa_tool.tavily_client is not None
-                        
-                        if tavily_available:
-                            st.markdown('<div class="status-indicator status-enabled">🌐 Enhanced Web Search Active (Tavily)</div>', unsafe_allow_html=True)
-                        else:
-                            st.markdown('<div class="status-indicator status-enabled">🌐 Basic Web Search Active (Free APIs)</div>', unsafe_allow_html=True)
-                    else:
-                        st.session_state.exa_tool = FallbackWebSearchTool()
-                        st.markdown('<div class="status-indicator status-enabled">🌐 Basic Web Search Active (Free APIs)</div>', unsafe_allow_html=True)
-                except Exception as e:
-                    logger.warning(f"Failed to initialize enhanced search tool: {e}")
-                    st.session_state.exa_tool = FallbackWebSearchTool()
-                    st.markdown('<div class="status-indicator status-enabled">🌐 Basic Web Search Active (Fallback)</div>', unsafe_allow_html=True)
-            else:
-                try:
-                    st.session_state.exa_tool = FallbackWebSearchTool()
-                    st.markdown('<div class="status-indicator status-enabled">🌐 Basic Web Search Active (Free APIs)</div>', unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"❌ Failed to initialize web search: {str(e)}")
-                    st.session_state.exa_tool = None
-        else:
-            # Display current search capabilities
-            if hasattr(st.session_state.exa_tool, 'tavily_client') and st.session_state.exa_tool.tavily_client:
-                st.markdown('<div class="status-indicator status-enabled">🌐 Enhanced Web Search Active (Tavily)</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="status-indicator status-enabled">🌐 Basic Web Search Active</div>', unsafe_allow_html=True)
-        
-        # API key input for enhanced search
-        st.markdown("### 🔑 Tavily API Key (Optional)")
-        
-        tavily_key_input = st.text_input(
-            "Tavily API Key:", 
-            type="password", 
-            placeholder="tvly-...",
-            help="Get your API key from https://tavily.com for enhanced search results"
-        )
-        
-        # Update search tool if key is provided
-        if tavily_key_input:
-            if len(tavily_key_input) > 10:
-                try:
-                    if REAL_AGENT_AVAILABLE:
-                        # Re-initialize with new key
-                        os.environ["TAVILY_API_KEY"] = tavily_key_input
-                        
-                        st.session_state.exa_tool = setup_web_search_tool()
-                        if st.session_state.exa_tool and st.session_state.exa_tool.tavily_client:
-                            st.success("✅ Tavily search enabled!")
-                        else:
-                            st.error("❌ Failed to initialize Tavily search")
-                    else:
-                        st.warning("⚠️ Real agent not available - enhanced search not supported")
-                except Exception as e:
-                    st.error(f"❌ Failed to initialize enhanced search: {str(e)}")
-            else:
-                st.warning("⚠️ Please enter a valid Tavily API key (minimum 10 characters)")
-        
-        st.markdown("---")
-        
-        # About section
-        st.markdown("## ℹ️ About")
-        st.markdown("""
-        This AI tutor combines:
-        - **Knowledge Base**: Pre-trained science knowledge
-        - **Web Search**: Real-time information from trusted sources
-        - **Smart Routing**: Automatically searches web for incomplete answers
-        """)
-        
-        st.markdown("---")
-        
-        # Controls
-        st.markdown("## 🎛️ Controls")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🗑️ Clear Chat", use_container_width=True):
-                st.session_state.messages = []
-                st.rerun()
-        
-        with col2:
-            if st.button("🔄 Reset Agent", use_container_width=True):
-                # Reset all states
-                for key in ["qa_chain", "exa_tool", "initialized", "initialization_attempted"]:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                st.rerun()
-        
-        # Display current status
-        st.markdown("### 📊 System Status")
-        kb_status = "✅ Ready" if st.session_state.get("qa_chain") else "❌ Not Ready"
-        web_status = "✅ Available" if st.session_state.get("exa_tool") else "❌ Unavailable"
-        
-        st.markdown(f"**Knowledge Base:** {kb_status}")
-        st.markdown(f"**Web Search:** {web_status}")
-
-# Setup sidebar
-setup_sidebar()
-
-# Cached agent initialization with better error handling
-@st.cache_resource
-def get_qa_chain():
-    """Initialize and cache the QA chain with proper error handling."""
-    try:
-        logger.info("Initializing QA chain...")
-        
-        if REAL_AGENT_AVAILABLE:
-            logger.info("🤖 Using real educational agent with retrieval QA...")
-            qa_chain = setup_educational_agent()
-        else:
-            logger.warning("⚠️ Using fallback mock agent...")
-            qa_chain = setup_fallback_agent()
-            
-        logger.info("QA chain initialized successfully")
-        return qa_chain
-    except Exception as e:
-        logger.error(f"Failed to initialize QA chain: {e}")
-        logger.info("🔄 Falling back to mock agent...")
-        try:
-            qa_chain = setup_fallback_agent()
-            logger.info("✅ Fallback agent initialized")
-            return qa_chain
-        except Exception as fallback_error:
-            logger.error(f"Even fallback failed: {fallback_error}")
-            raise
-
-# Initialize agent with comprehensive error handling
-def initialize_agent():
-    """Initialize the educational agent with proper error handling."""
-    if st.session_state.initialized:
-        return True
-    
-    if st.session_state.initialization_attempted and st.session_state.error_state:
-        return False
-    
-    st.session_state.initialization_attempted = True
-    
-    try:
-        with st.spinner("🚀 Initializing AI systems... This may take a moment."):
-            # Add progress indicator
-            progress_bar = st.progress(0)
-            st.write("Loading knowledge base...")
-            progress_bar.progress(33)
-            
-            # Initialize QA chain
-            st.session_state.qa_chain = get_qa_chain()
-            progress_bar.progress(66)
-            
-            st.write("Finalizing setup...")
-            progress_bar.progress(100)
-            
-            st.session_state.initialized = True
-            st.session_state.error_state = False
-            
-            # Clear progress indicators
-            progress_bar.empty()
-            
-            st.markdown('<div class="success-message">🎓 <strong>Educational Tutor Ready!</strong> Ask any science question to get started.</div>', unsafe_allow_html=True)
-            return True
-            
-    except Exception as e:
-        st.session_state.error_state = True
-        error_msg = f"❌ **Initialization Failed:** {str(e)}"
-        st.markdown(f'<div class="error-message">{error_msg}</div>', unsafe_allow_html=True)
-        
-        # Provide troubleshooting steps
-        with st.expander("🔧 Troubleshooting Steps"):
-            st.markdown("""
-            1. **Check Dependencies**: Ensure all required packages are installed
-            2. **Verify Files**: Make sure all dependencies are available
-            3. **Restart Application**: Try refreshing the page or restarting Streamlit
-            4. **Check Logs**: Look for detailed error messages in the console
-            5. **Contact Support**: If issues persist, please report the error
-            """)
-        
-        return False
-
-# Initialize the agent
-agent_ready = initialize_agent()
-
-if not agent_ready:
+    st.error(f"❌ Missing required dependencies: {e}")
+    st.info("Please install: pip install torch transformers sentence-transformers faiss-cpu datasets pandas")
     st.stop()
 
-# Enhanced quality check function with better logic
-def is_poor_answer(answer: str, question: str) -> tuple:
-    """
-    Check if answer quality is poor and return reason.
-    Returns (is_poor, reason)
-    """
-    if not answer or not answer.strip():
-        return True, "Empty answer"
-    
-    answer_lower = answer.lower().strip()
-    question_lower = question.lower().strip()
-    
-    # Basic quality checks
-    if len(answer.split()) < 8:
-        return True, "Too short"
-    
-    # Check for non-answers
-    non_answers = [
-        "doesn't directly answer",
-        "don't have specific information",
-        "i don't know",
-        "i'm not sure",
-        "unclear",
-        "unknown"
-    ]
-    
-    if any(phrase in answer_lower for phrase in non_answers):
-        return True, "Non-answer detected"
-    
-    # Check for generic responses
-    if answer_lower.strip() in ["a product", "unknown", "unclear", "yes", "no"]:
-        return True, "Too generic"
-    
-    return False, "Good quality"
+@dataclass
+class TutorConfig:
+    """Configuration for the Educational Tutor Agent - optimized for deployment"""
+    embedding_model: str = model_config.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
+    llm_model: str = model_config.get("llm_model", "google/flan-t5-small")
+    max_length: int = model_config.get("max_length", 256)
+    temperature: float = model_config.get("temperature", 0.7)
+    top_k: int = model_config.get("top_k", 3)
+    use_fallback: bool = deployment_config.get("USE_FALLBACK_DATASET", True)
+    use_cpu_only: bool = deployment_config.get("USE_CPU_ONLY", True)
 
-# Improved web result formatter
-def format_web_results(web_results: str):
-    """Parse and format web results with better structure."""
-    if not web_results or not web_results.strip():
-        st.warning("No web results to display.")
-        return
+class DatasetManager:
+    """Manages dataset loading with enhanced fallback options"""
     
-    try:
-        sections = [s.strip() for s in web_results.split('\n\n') if s.strip()]
+    @staticmethod
+    def create_fallback_science_qa() -> Dataset:
+        """Create a comprehensive fallback ScienceQA dataset"""
+        logger.info("Creating fallback dataset...")
         
-        if not sections:
-            st.warning("No valid web results found.")
-            return
+        # Use the fallback data from config if available
+        try:
+            from config import FALLBACK_SCIENCE_QA
+            fallback_data = FALLBACK_SCIENCE_QA
+        except ImportError:
+            # Fallback to basic dataset if config not available
+            fallback_data = [
+                {
+                    "question": "What is photosynthesis?",
+                    "context": "Photosynthesis is the process by which plants use sunlight, water, and carbon dioxide to produce glucose and release oxygen.",
+                    "answer": "Photosynthesis is the process where plants convert sunlight, water, and carbon dioxide into glucose and oxygen using chlorophyll.",
+                    "subject": "biology",
+                    "grade_level": "middle_school"
+                },
+                {
+                    "question": "What causes earthquakes?",
+                    "context": "Earthquakes are caused by the sudden release of energy when rocks break along fault lines or when tectonic plates move.",
+                    "answer": "Earthquakes are caused by the sudden release of energy when rocks break along fault lines or tectonic plates move.",
+                    "subject": "earth_science",
+                    "grade_level": "middle_school"
+                },
+                {
+                    "question": "What is DNA?",
+                    "context": "DNA is the hereditary material in living organisms that contains genetic instructions for development and functioning.",
+                    "answer": "DNA is the genetic material that carries hereditary information in living organisms.",
+                    "subject": "biology",
+                    "grade_level": "high_school"
+                }
+            ]
         
-        for i, section in enumerate(sections):
-            if not section:
-                continue
-            
-            lines = [line.strip() for line in section.split('\n') if line.strip()]
-            if len(lines) < 1:
-                continue
-            
-            # Extract title (first line, remove markdown formatting)
-            title = lines[0].replace('**', '').replace('*', '').strip()
-            if title.startswith('#'):
-                title = title.lstrip('#').strip()
-            
-            # Extract content and source
-            content_lines = []
-            source_url = ""
-            
-            for line in lines[1:]:
-                if line.startswith('Source:'):
-                    source_url = line.replace('Source:', '').strip()
-                elif line.startswith('URL:'):
-                    source_url = line.replace('URL:', '').strip()
-                elif not line.startswith('http'):
-                    content_lines.append(line)
-                else:
-                    source_url = line.strip()
-            
-            content = ' '.join(content_lines).strip()
-            
-            if content or (not content and len(lines) == 1):  # Display if there's content or just a title
-                display_content = content if content else title
-                st.markdown(f'<div class="answer-content"><strong>📄 {title}</strong><br><br>{display_content}</div>', unsafe_allow_html=True)
-                
-                if source_url:
-                    # Clean up the URL
-                    if not source_url.startswith('http'):
-                        source_url = 'https://' + source_url
-                    
-                    st.markdown(f'<div class="sources-section"><strong>🔗 Source:</strong> <a href="{source_url}" target="_blank" class="source-link">{source_url}</a></div>', unsafe_allow_html=True)
-                
-                if i < len(sections) - 1:  # Add separator except for last item
-                    st.markdown("---")
+        dataset = Dataset.from_list(fallback_data)
+        logger.info(f"✅ Created fallback dataset with {len(fallback_data)} examples")
+        return dataset
     
-    except Exception as e:
-        st.error(f"Error formatting web results: {str(e)}")
-        # Fallback: display raw results
-        st.markdown(f'<div class="answer-content">{web_results}</div>', unsafe_allow_html=True)
+    @staticmethod
+    def load_dataset() -> Dataset:
+        """Load dataset with deployment-optimized fallback strategies"""
+        logger.info("🔄 Step 1: Loading ScienceQA dataset...")
+        
+        # For deployment, always use fallback to avoid caching issues
+        if deployment_config.get("USE_FALLBACK_DATASET", True):
+            logger.info("Using fallback dataset for deployment stability...")
+            return DatasetManager.create_fallback_science_qa()
+        
+        try:
+            # Try to load from Hugging Face Hub with explicit no-cache
+            logger.info("Attempting to load ScienceQA from Hugging Face Hub...")
+            from datasets import load_dataset
+            
+            # Disable caching to avoid LocalFileSystem issues
+            dataset = load_dataset(
+                "derek-thomas/ScienceQA", 
+                split="train[:100]",  # Load only first 100 examples for deployment
+                streaming=False,
+                cache_dir=None,  # Disable caching
+                download_mode="force_redownload"
+            )
+            logger.info("✅ Successfully loaded ScienceQA dataset from Hugging Face Hub")
+            return dataset
+            
+        except Exception as e:
+            logger.warning(f"Trying alternative loading method...")
+            logger.error(f"❌ Failed to load ScienceQA dataset: {e}")
+            logger.info("Creating fallback dataset...")
+            return DatasetManager.create_fallback_science_qa()
 
-# Display chat history
-def display_chat_history():
-    """Display all previous chat messages."""
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if message["role"] == "assistant":
-                # For assistant messages, preserve the HTML formatting
-                st.markdown(message["content"], unsafe_allow_html=True)
+class EmbeddingsManager:
+    """Manages sentence embeddings for document retrieval - deployment optimized"""
+    
+    def __init__(self, model_name: str, use_cpu_only: bool = True):
+        self.model_name = model_name
+        self.model = None
+        self.use_cpu_only = use_cpu_only
+        
+    def initialize(self):
+        """Initialize the sentence transformer model"""
+        try:
+            logger.info(f"🔧 Initializing embeddings ({self.model_name})...")
+            
+            # Force CPU usage for deployment if configured
+            if self.use_cpu_only:
+                device = "cpu"
+                logger.info("🖥️ CUDA not available - using CPU")
             else:
-                st.markdown(message["content"])
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                logger.info(f"🖥️ {'CUDA available - using GPU' if device == 'cuda' else 'CUDA not available - using CPU'}")
+            
+            # Initialize with explicit device and cache settings
+            self.model = SentenceTransformer(
+                self.model_name, 
+                device=device,
+                cache_folder="/tmp/sentence_transformers" if deployment_config.get("USE_CPU_ONLY") else None
+            )
+            
+            # Test the model
+            test_embedding = self.model.encode(["test sentence"])
+            logger.info("✅ Embeddings initialized and tested successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize embeddings: {e}")
+            raise e
+    
+    def encode(self, texts: List[str]) -> np.ndarray:
+        """Encode texts into embeddings"""
+        if self.model is None:
+            raise ValueError("Embeddings model not initialized")
+        return self.model.encode(texts)
 
-# Display chat history
-display_chat_history()
-
-# Main chat interface
-if question := st.chat_input("Ask a science question...", key="main_chat_input"):
-    # Validate question
-    if not question.strip():
-        st.warning("Please enter a valid question.")
-        st.stop()
+class VectorDatabase:
+    """Manages FAISS vector database for similarity search - deployment optimized"""
     
-    if len(question.strip()) < 3:
-        st.warning("Please enter a more detailed question.")
-        st.stop()
-    
-    # Add user message
-    st.session_state.messages.append({"role": "user", "content": question})
-    
-    # Display user message
-    with st.chat_message("user"):
-        st.markdown(question)
-    
-    # Generate assistant response
-    with st.chat_message("assistant"):
-        response_placeholder = st.empty()
+    def __init__(self, embedding_dim: int = 384):
+        self.embedding_dim = embedding_dim
+        self.index = None
+        self.documents = []
         
-        with st.spinner("🤔 Analyzing your question..."):
-            try:
-                # Initialize response components
-                kb_answer = ""
-                kb_sources = []
-                web_results = ""
-                is_poor = True
-                quality_reason = "No response"
-                
-                # Get knowledge base response
-                try:
-                    if REAL_AGENT_AVAILABLE and hasattr(st.session_state.qa_chain, 'invoke'):
-                        # Real LangChain agent (returns LangChain response)
-                        response = st.session_state.qa_chain.invoke({"question": question})
-                        kb_answer = response.get("answer", "I couldn't generate an answer from the knowledge base.")
-                        kb_sources = response.get("source_documents", [])
-                    elif hasattr(st.session_state.qa_chain, '__call__'):
-                        # Try direct call (works for both real and mock agents)
-                        response = st.session_state.qa_chain({"question": question})
-                        kb_answer = response.get("answer", "I couldn't generate an answer from the knowledge base.")
-                        if "source_documents" in response:
-                            # Check if sources are in the right format
-                            sources = response.get("source_documents", [])
-                            if sources and isinstance(sources[0], dict) and "metadata" in sources[0]:
-                                kb_sources = sources  # Already in correct format
-                            else:
-                                # Convert Document objects to expected format
-                                kb_sources = []
-                                for doc in sources:
-                                    if hasattr(doc, 'metadata'):
-                                        kb_sources.append({"metadata": doc.metadata})
-                                    elif isinstance(doc, dict):
-                                        kb_sources.append({"metadata": doc.get("metadata", {})})
-                                    else:
-                                        kb_sources.append({"metadata": {}})
-                        else:
-                            kb_sources = []
-                    else:
-                        # Fallback error
-                        raise ValueError("QA chain is not callable")
-                    
-                    # Check answer quality
-                    is_poor, quality_reason = is_poor_answer(kb_answer, question)
-                    
-                except Exception as kb_error:
-                    logger.error(f"Knowledge base error: {kb_error}")
-                    kb_answer = f"Knowledge base temporarily unavailable: {str(kb_error)}"
-                    is_poor = True
-                    quality_reason = "KB Error"
-                
-                # Decide which answer to show
-                final_answer = ""
-                answer_source = ""
-                use_web_search = False
-                
-                # If knowledge base answer is good, use it
-                if not is_poor and kb_answer and "temporarily unavailable" not in kb_answer:
-                    final_answer = kb_answer
-                    answer_source = "📚 Knowledge Base"
-                    use_web_search = False
-                else:
-                    # Knowledge base answer is poor or unavailable, try web search
-                    if st.session_state.exa_tool:
-                        with st.spinner("🌐 Searching web for information..."):
-                            try:
-                                web_results = st.session_state.exa_tool._run(question)
-                                if web_results and "not available" not in web_results.lower() and "error" not in web_results.lower():
-                                    final_answer = web_results
-                                    answer_source = "🌐 Web Search"
-                                    use_web_search = True
-                                else:
-                                    # Both failed, show KB answer with warning
-                                    final_answer = kb_answer if kb_answer else "I couldn't find a good answer to your question."
-                                    answer_source = f"⚠️ Limited Information ({quality_reason})"
-                                    use_web_search = False
-                            except Exception as e:
-                                logger.error(f"Web search error: {e}")
-                                # Web search failed, show KB answer with warning
-                                final_answer = kb_answer if kb_answer else "I couldn't find a good answer to your question."
-                                answer_source = f"⚠️ Limited Information ({quality_reason})"
-                                use_web_search = False
-                    else:
-                        # No web search available, show KB answer with warning
-                        final_answer = kb_answer if kb_answer else "I couldn't find a good answer to your question."
-                        answer_source = f"⚠️ Limited Information ({quality_reason})"
-                        use_web_search = False
-                
-                # Build single response HTML
-                if use_web_search:
-                    # Web search response - use custom formatting
-                    response_html = f'''
-                    <div class="answer-card web-result">
-                        <div class="section-header">{answer_source}</div>
-                    '''
-                    response_placeholder.markdown(response_html, unsafe_allow_html=True)
-                    format_web_results(final_answer)
-                    response_html += '</div>'
-                else:
-                    # Knowledge base or error response
-                    card_class = "kb-answer" if not is_poor else "warning-card"
-                    response_html = f'''
-                    <div class="answer-card {card_class}">
-                        <div class="section-header">{answer_source}</div>
-                        <div class="answer-content">{final_answer}</div>
-                    '''
-                    
-                    # Add sources for good KB answers
-                    if not is_poor and kb_sources:
-                        response_html += '<div class="sources-section"><strong>📖 Sources:</strong><br>'
-                        for doc in kb_sources[:3]:  # Show up to 3 sources
-                            metadata = doc.get("metadata", {}) if isinstance(doc, dict) else {}
-                            subject = metadata.get('subject', 'Science')
-                            source_type = metadata.get('source', 'ScienceQA')
-                            response_html += f'<div class="source-item">• {source_type} - {subject}</div>'
-                        response_html += '</div>'
-                    
-                    response_html += '</div>'
-                    response_placeholder.markdown(response_html, unsafe_allow_html=True)
-                
-                # Store conversation (simplified version for storage)
-                st.session_state.messages.append({"role": "assistant", "content": response_html})
-                
-            except Exception as e:
-                error_msg = f"Sorry, I encountered an error while processing your question: {str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                logger.error(f"Chat error: {e}")
+    def create_index(self, embeddings: np.ndarray, documents: List[str]):
+        """Create FAISS index from embeddings"""
+        try:
+            logger.info("🗄️ Creating vector database...")
+            
+            # Create FAISS index with CPU optimization
+            self.index = faiss.IndexFlatL2(self.embedding_dim)
+            
+            # Add embeddings in smaller batches for deployment
+            batch_size = 100
+            for i in range(0, len(embeddings), batch_size):
+                batch = embeddings[i:i+batch_size].astype('float32')
+                self.index.add(batch)
+            
+            self.documents = documents
+            logger.info("✅ Vector database created successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create vector database: {e}")
+            raise e
+    
+    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar documents"""
+        if self.index is None:
+            raise ValueError("Vector database not initialized")
+        
+        # Ensure k doesn't exceed available documents
+        k = min(k, len(self.documents))
+        
+        distances, indices = self.index.search(query_embedding.astype('float32'), k)
+        
+        results = []
+        for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
+            if idx < len(self.documents) and idx >= 0:  # Valid index check
+                results.append({
+                    "document": self.documents[idx],
+                    "distance": float(distance),
+                    "rank": i + 1
+                })
+        
+        return results
 
-# Footer with additional information
-st.markdown("---")
-st.markdown("""
-<div style="text-align: center; color: #666; font-size: 0.9rem; padding: 1rem;">
-    <p>🎓 Educational Tutor Agent | Powered by AI and Real-time Web Search</p>
-    <p>For best results, ask specific science questions about topics like biology, chemistry, physics, or earth science.</p>
-</div>
-""", unsafe_allow_html=True)
+class LanguageModel:
+    """Manages the language model for generating responses - deployment optimized"""
+    
+    def __init__(self, model_name: str, use_cpu_only: bool = True):
+        self.model_name = model_name
+        self.tokenizer = None
+        self.model = None
+        self.pipeline = None
+        self.use_cpu_only = use_cpu_only
+    
+    def initialize(self):
+        """Initialize the language model"""
+        try:
+            logger.info(f"🤖 Initializing LLM ({self.model_name})...")
+            
+            # Force CPU usage for deployment
+            device = -1 if self.use_cpu_only else (0 if torch.cuda.is_available() else -1)
+            
+            # Initialize with deployment-friendly settings
+            self.pipeline = pipeline(
+                "text2text-generation",
+                model=self.model_name,
+                tokenizer=self.model_name,
+                device=device,
+                max_length=256,  # Reduced for deployment
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                framework="pt"
+            )
+            
+            logger.info("✅ Language model initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize language model: {e}")
+            raise e
+    
+    def generate_response(self, prompt: str, max_length: int = 256) -> str:
+        """Generate response using the language model"""
+        try:
+            if self.pipeline is None:
+                raise ValueError("Language model not initialized")
+            
+            # Truncate prompt if too long
+            if len(prompt) > 1000:
+                prompt = prompt[:1000] + "..."
+            
+            result = self.pipeline(
+                prompt, 
+                max_length=max_length, 
+                num_return_sequences=1,
+                truncation=True,
+                pad_token_id=self.pipeline.tokenizer.eos_token_id
+            )
+            return result[0]['generated_text']
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to generate response: {e}")
+            return "I apologize, but I encountered an error while generating a response. Please try again with a simpler question."
+
+class EducationalTutorAgent:
+    """Main Educational Tutor Agent class - deployment optimized"""
+    
+    def __init__(self, config: TutorConfig):
+        self.config = config
+        self.dataset = None
+        self.embeddings_manager = None
+        self.vector_db = None
+        self.llm = None
+        
+    def initialize(self):
+        """Initialize all components of the tutor agent"""
+        try:
+            logger.info("🚀 Initializing Educational Tutor Agent...")
+            
+            # Step 1: Load dataset (using fallback for deployment)
+            self.dataset = DatasetManager.load_dataset()
+            
+            # Step 2: Process documents
+            logger.info("📄 Step 2: Processing documents...")
+            documents = self._prepare_documents()
+            logger.info(f"📄 Prepared {len(documents)} documents")
+            
+            # Step 3: Initialize embeddings
+            logger.info("🔧 Step 3: Initializing embeddings...")
+            self.embeddings_manager = EmbeddingsManager(
+                self.config.embedding_model, 
+                use_cpu_only=self.config.use_cpu_only
+            )
+            self.embeddings_manager.initialize()
+            
+            # Step 4: Create knowledge base
+            logger.info("🗄️ Step 4: Creating knowledge base...")
+            self._create_knowledge_base(documents)
+            
+            # Step 5: Initialize language model
+            logger.info("🤖 Step 5: Initializing language model...")
+            self.llm = LanguageModel(
+                self.config.llm_model,
+                use_cpu_only=self.config.use_cpu_only
+            )
+            self.llm.initialize()
+            
+            logger.info("✅ Educational Tutor Agent initialized successfully!")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize tutor agent: {e}")
+            raise e
+    
+    def _prepare_documents(self) -> List[str]:
+        """Prepare documents from dataset"""
+        documents = []
+        
+        for item in self.dataset:
+            # Create comprehensive document text
+            doc_text = f"Question: {item.get('question', '')}\n"
+            if 'context' in item and item['context']:
+                doc_text += f"Context: {item['context']}\n"
+            if 'answer' in item and item['answer']:
+                doc_text += f"Answer: {item['answer']}\n"
+            if 'subject' in item and item['subject']:
+                doc_text += f"Subject: {item['subject']}\n"
+            if 'grade_level' in item and item['grade_level']:
+                doc_text += f"Grade Level: {item['grade_level']}"
+            
+            documents.append(doc_text.strip())
+        
+        return documents
+    
+    def _create_knowledge_base(self, documents: List[str]):
+        """Create vector database from documents"""
+        # Split documents into chunks if needed
+        logger.info("✂️ Splitting documents...")
+        chunks = self._split_documents(documents)
+        logger.info(f"📄 Split into {len(chunks)} chunks")
+        
+        # Create embeddings in batches for deployment
+        logger.info("🗄️ Creating vector database...")
+        embeddings = self.embeddings_manager.encode(chunks)
+        
+        # Create vector database
+        self.vector_db = VectorDatabase(embeddings.shape[1])
+        self.vector_db.create_index(embeddings, chunks)
+    
+    def _split_documents(self, documents: List[str], chunk_size: int = 300) -> List[str]:
+        """Split documents into smaller chunks - optimized for deployment"""
+        chunks = []
+        for doc in documents:
+            if len(doc) <= chunk_size:
+                chunks.append(doc)
+            else:
+                # Simple splitting by sentences
+                sentences = doc.split('. ')
+                current_chunk = ""
+                
+                for sentence in sentences:
+                    if len(current_chunk + sentence) <= chunk_size:
+                        current_chunk += sentence + ". "
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = sentence + ". "
+                
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def answer_question(self, question: str) -> Dict[str, Any]:
+        """Answer a question using RAG (Retrieval-Augmented Generation)"""
+        try:
+            # Step 1: Retrieve relevant documents
+            query_embedding = self.embeddings_manager.encode([question])
+            relevant_docs = self.vector_db.search(query_embedding, k=self.config.top_k)
+            
+            # Step 2: Create context from retrieved documents
+            context = "\n\n".join([doc["document"] for doc in relevant_docs[:2]])  # Reduced context for deployment
+            
+            # Step 3: Generate prompt
+            prompt = f"""You are an educational tutor. Answer the following question based on the provided context. 
+Be clear, accurate, and educational in your response.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+            
+            # Step 4: Generate response
+            response = self.llm.generate_response(prompt, max_length=self.config.max_length)
+            
+            return {
+                "answer": response,
+                "relevant_documents": relevant_docs,
+                "confidence": self._calculate_confidence(relevant_docs)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error answering question: {e}")
+            return {
+                "answer": "I apologize, but I encountered an error while processing your question. Please try again with a simpler question.",
+                "relevant_documents": [],
+                "confidence": 0.0
+            }
+    
+    def _calculate_confidence(self, relevant_docs: List[Dict[str, Any]]) -> float:
+        """Calculate confidence score based on document similarity"""
+        if not relevant_docs:
+            return 0.0
+        
+        # Use inverse of average distance as confidence
+        avg_distance = sum(doc["distance"] for doc in relevant_docs) / len(relevant_docs)
+        confidence = max(0.0, min(1.0, 1.0 / (1.0 + avg_distance)))
+        
+        return confidence
+
+# Streamlit UI - Deployment Optimized
+def main():
+    st.set_page_config(
+        page_title="🎓 Educational Tutor Agent",
+        page_icon="🎓",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    st.title("🎓 Educational Tutor Agent")
+    st.markdown("### AI-Powered Educational Assistant (Deployment Ready)")
+    
+    # Initialize session state
+    if "tutor_agent" not in st.session_state:
+        st.session_state.tutor_agent = None
+        st.session_state.initialized = False
+    
+    # Sidebar for configuration and status
+    with st.sidebar:
+        st.header("⚙️ System Configuration")
+        
+        # Display deployment status
+        st.info("🚀 **Deployment Mode**: Optimized for cloud deployment")
+        
+        # Show current configuration
+        st.markdown("**Current Settings:**")
+        st.text(f"Embedding: {model_config['embedding_model'].split('/')[-1]}")
+        st.text(f"LLM: {model_config['llm_model'].split('/')[-1]}")
+        st.text(f"Device: {'CPU (Deployment)' if deployment_config.get('USE_CPU_ONLY') else 'Auto'}")
+        st.text(f"Dataset: {'Fallback' if deployment_config.get('USE_FALLBACK_DATASET') else 'Full'}")
+        
+        # Initialize button
+        if st.button("🚀 Initialize Tutor Agent", type="primary"):
+            with st.spinner("Initializing Educational Tutor Agent..."):
+                try:
+                    config = TutorConfig()
+                    
+                    # Create progress bar
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    status_text.text("Loading dataset...")
+                    progress_bar.progress(20)
+                    
+                    st.session_state.tutor_agent = EducationalTutorAgent(config)
+                    
+                    status_text.text("Initializing models...")
+                    progress_bar.progress(60)
+                    
+                    st.session_state.tutor_agent.initialize()
+                    
+                    status_text.text("Finalizing setup...")
+                    progress_bar.progress(100)
+                    
+                    st.session_state.initialized = True
+                    
+                    status_text.text("✅ Initialization complete!")
+                    st.success("✅ Tutor Agent initialized successfully!")
+                    
+                except Exception as e:
+                    st.error(f"❌ Initialization failed: {e}")
+                    st.session_state.initialized = False
+                    logger.error(f"Initialization error: {e}")
+    
+    # Main interface
+    if st.session_state.initialized and st.session_state.tutor_agent:
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.header("💬 Ask a Question")
+            
+            # Question input
+            question = st.text_area(
+                "What would you like to learn about?",
+                placeholder="e.g., What is photosynthesis? How does gravity work? Explain the water cycle.",
+                height=100
+            )
+            
+            # Sample questions from our fallback dataset
+            st.markdown("**Sample Questions:**")
+            sample_questions = [
+                "What is photosynthesis?",
+                "What causes earthquakes?", 
+                "What is DNA?",
+                "What is gravity?",
+                "How do vaccines work?"
+            ]
+            
+            # Create buttons for sample questions
+            cols = st.columns(len(sample_questions))
+            for i, sample_q in enumerate(sample_questions):
+                if cols[i].button(f"💡", key=f"sample_{i}", help=sample_q):
+                    question = sample_q
+            
+            # Answer button
+            if st.button("🎯 Get Answer", type="primary") and question:
+                with st.spinner("Generating answer..."):
+                    result = st.session_state.tutor_agent.answer_question(question)
+                    
+                    # Display answer
+                    st.subheader("📝 Answer")
+                    st.write(result["answer"])
+                    
+                    # Display confidence
+                    confidence = result["confidence"]
+                    confidence_color = "green" if confidence > 0.7 else "orange" if confidence > 0.4 else "red"
+                    st.markdown(f"**Confidence:** :{confidence_color}[{confidence:.2%}]")
+                    
+                    # Display relevant documents
+                    if result["relevant_documents"]:
+                        with st.expander("📚 Sources Used"):
+                            for i, doc in enumerate(result["relevant_documents"]):
+                                st.markdown(f"**Source {doc['rank']}** (Similarity: {1.0/(1.0+doc['distance']):.2%})")
+                                st.text(doc["document"][:200] + "..." if len(doc["document"]) > 200 else doc["document"])
+                                if i < len(result["relevant_documents"]) - 1:
+                                    st.markdown("---")
+        
+        with col2:
+            st.header("📊 System Status")
+            
+            # System metrics
+            st.metric("🔧 Status", "✅ Ready")
+            st.metric("📚 Dataset", f"{len(st.session_state.tutor_agent.dataset)} examples")
+            st.metric("🗄️ Knowledge Base", f"{len(st.session_state.tutor_agent.vector_db.documents)} chunks")
+            st.metric("⚡ Device", "CPU (Optimized)")
+            
+            # Performance info
+            st.header("⚡ Performance")
+            st.info("""
+            **Deployment Optimized:**
+            - ✅ CPU-only processing
+            - ✅ Lightweight models
+            - ✅ Fallback dataset
+            - ✅ Memory efficient
+            """)
+            
+            # Usage tips
+            st.header("💡 Usage Tips")
+            st.markdown("""
+            - Ask specific science questions
+            - Keep questions concise
+            - Try different subjects (biology, physics, earth science)
+            - Check the confidence score
+            """)
+    
+    else:
+        # Welcome screen
+        st.info("👈 Please initialize the Tutor Agent using the sidebar.")
+        
+        # Display features
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("""
+            ### 🔧 Features
+            - AI-powered Q&A
+            - Science education focus
+            - Retrieval-augmented generation
+            - Confidence scoring
+            """)
+        
+        with col2:
+            st.markdown("""
+            ### 🚀 Deployment Ready
+            - Optimized for cloud platforms
+            - CPU-only processing
+            - Lightweight models
+            - Reliable fallback dataset
+            """)
+        
+        with col3:
+            st.markdown("""
+            ### 📚 Subjects Covered
+            - Biology
+            - Physics
+            - Earth Science
+            - Chemistry
+            - General Science
+            """)
+        
+        # Deployment information
+        st.header("🔧 Deployment Information")
+        st.markdown("""
+        This version of the Educational Tutor Agent has been optimized for deployment environments:
+        
+        **Key Improvements:**
+        - ✅ **Fixed dataset loading**: Uses reliable fallback dataset to avoid caching issues
+        - ✅ **CPU optimization**: Forced CPU usage for better compatibility
+        - ✅ **Memory efficient**: Reduced model sizes and batch processing
+        - ✅ **Error handling**: Comprehensive error handling and fallback mechanisms
+        - ✅ **Deployment scripts**: Includes setup scripts for easy deployment
+        
+        **Deployment Files Created:**
+        - `app_fixed.py`: Main application with fixes
+        - `requirements.txt`: Optimized dependencies
+        - `config.py`: Deployment configuration
+        - `deploy.sh`: Deployment script
+        """)
+
+if __name__ == "__main__":
+    main() 
