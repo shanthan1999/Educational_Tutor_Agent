@@ -525,54 +525,76 @@ def setup_educational_agent():
         # Step 8: Create QA chain
         logger.info("🔗 Step 8: Creating question-answering chain...")
         
-        # Create a custom chain that incorporates web search
-        class CustomRetrievalQA(ConversationalRetrievalChain):
-            web_search_tool: Optional[Any] = None
-
-            def _call(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        # Get web search tool
+        web_search_tool = setup_web_search_tool()
+        
+        # Create a simple wrapper class that handles the QA process
+        class EducationalQAAgent:
+            def __init__(self, llm, retriever, memory, web_search_tool=None):
+                self.llm = llm
+                self.retriever = retriever
+                self.memory = memory
+                self.web_search_tool = web_search_tool
+                
+            def __call__(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
                 question = inputs["question"]
-                chat_history = self.memory.load_memory_variables({})[self.memory.memory_key]
-
+                
                 # Retrieve documents from vectorstore
                 docs = self.retriever.get_relevant_documents(question)
                 context = "\n\n".join([doc.page_content for doc in docs])
-
-                web_search_results = "No web search performed." # Default value
-                if self.web_search_tool:
-                    logger.info(f"Performing web search for: {question}")
-                    try:
-                        web_results = self.web_search_tool._run(question)
-                        web_search_results = f"Web Search Results:\n{web_results}"
-                    except Exception as e:
-                        logger.warning(f"Web search failed: {e}")
-                        web_search_results = f"Web search failed: {e}"
-
-                # Prepare inputs for the LLM
-                llm_inputs = {
-                    "question": question,
-                    "context": context,
-                    "web_search_results": web_search_results,
-                    "chat_history": chat_history # Pass chat history to the prompt
-                }
-
+                
+                # Default web search results
+                web_search_results = "No web search performed."
+                
+                # Check if answer quality might be poor, then search web
+                if len(context.strip()) < 100 or not context.strip():
+                    if self.web_search_tool:
+                        logger.info(f"Performing web search for: {question}")
+                        try:
+                            web_results = self.web_search_tool._run(question)
+                            web_search_results = f"Web Search Results:\n{web_results}"
+                        except Exception as e:
+                            logger.warning(f"Web search failed: {e}")
+                            web_search_results = f"Web search failed: {e}"
+                
+                # Prepare prompt
+                prompt_text = PROMPT_TEMPLATE.format(
+                    context=context,
+                    question=question,
+                    web_search_results=web_search_results
+                )
+                
                 # Generate answer using the LLM
-                answer = self.combine_docs_chain.run(llm_inputs)
-
+                try:
+                    answer = self.llm.invoke(prompt_text)
+                    if hasattr(answer, 'content'):
+                        answer = answer.content
+                    elif isinstance(answer, list) and len(answer) > 0:
+                        answer = answer[0]
+                    elif not isinstance(answer, str):
+                        answer = str(answer)
+                except Exception as e:
+                    logger.warning(f"LLM invoke failed, trying alternative: {e}")
+                    try:
+                        # Fallback to older method
+                        answer = self.llm(prompt_text)
+                    except Exception as e2:
+                        logger.error(f"LLM call failed: {e2}")
+                        answer = "I apologize, but I'm having trouble generating a response right now."
+                
                 # Save to memory
-                self.memory.save_context({"question": question}, {"answer": answer})
-
+                try:
+                    self.memory.save_context({"question": question}, {"answer": answer})
+                except Exception as e:
+                    logger.warning(f"Memory save failed: {e}")
+                
                 return {"answer": answer, "source_documents": docs}
-
-        qa_chain = CustomRetrievalQA(
+        
+        qa_chain = EducationalQAAgent(
             llm=llm,
             retriever=retriever,
             memory=memory,
-            return_source_documents=True,
-            combine_docs_chain_kwargs={"prompt": PROMPT_TEMPLATE},
-            verbose=False,
-            max_tokens_limit=2000,
-            get_chat_history=lambda h: h,
-            web_search_tool=setup_web_search_tool() # Pass the web search tool here
+            web_search_tool=web_search_tool
         )
         
         logger.info("✅ Educational Tutor Agent setup complete!")
