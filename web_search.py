@@ -8,11 +8,50 @@ from typing import Optional, Dict, Any, List
 from langchain.tools import BaseTool
 from langchain.callbacks.manager import CallbackManagerForToolRun
 
-# Ensure .env file is loaded
-from dotenv import load_dotenv
-load_dotenv()
+# Environment variable loading - compatible with Streamlit Cloud
+def load_env_safely():
+    """Load environment variables safely for both local and cloud environments."""
+    try:
+        # Try dotenv for local development
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        # dotenv not available in cloud environments - that's fine
+        pass
+    except Exception:
+        # Any other error loading dotenv - continue without it
+        pass
+
+load_env_safely()
 
 logger = logging.getLogger(__name__)
+
+def get_tavily_api_key() -> Optional[str]:
+    """Get Tavily API key from multiple sources with cloud compatibility."""
+    # Try multiple environment variable sources
+    api_key = None
+    
+    # Method 1: Direct os.environ (works in Streamlit Cloud)
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if api_key and api_key.strip() and not api_key.startswith("your_"):
+        return api_key.strip()
+    
+    # Method 2: os.getenv (fallback)
+    api_key = os.getenv("TAVILY_API_KEY")
+    if api_key and api_key.strip() and not api_key.startswith("your_"):
+        return api_key.strip()
+    
+    # Method 3: Check Streamlit secrets (if available)
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and 'TAVILY_API_KEY' in st.secrets:
+            api_key = st.secrets['TAVILY_API_KEY']
+            if api_key and api_key.strip() and not api_key.startswith("your_"):
+                return api_key.strip()
+    except Exception:
+        pass
+    
+    return None
 
 class EnhancedWebSearchTool(BaseTool):
     """Enhanced web search tool with Tavily as primary search provider."""
@@ -22,11 +61,21 @@ class EnhancedWebSearchTool(BaseTool):
     
     def __init__(self, tavily_api_key: Optional[str] = None):
         super().__init__()
+        
+        # Get API key with cloud compatibility
+        final_api_key = tavily_api_key or get_tavily_api_key()
+        
         # Store API key as instance variable (not Pydantic field)
-        object.__setattr__(self, 'tavily_api_key', tavily_api_key or os.getenv("TAVILY_API_KEY"))
+        object.__setattr__(self, 'tavily_api_key', final_api_key)
         
         # Initialize search client
         object.__setattr__(self, 'tavily_client', None)
+        
+        # Log API key status for debugging
+        if final_api_key:
+            logger.info(f"🔑 Tavily API key found: {final_api_key[:10]}...")
+        else:
+            logger.warning("🔑 No Tavily API key found")
         
         self._setup_clients()
     
@@ -37,14 +86,30 @@ class EnhancedWebSearchTool(BaseTool):
             try:
                 from tavily import TavilyClient
                 object.__setattr__(self, 'tavily_client', TavilyClient(api_key=self.tavily_api_key))
-                logger.info("✅ Tavily search client initialized")
+                logger.info("✅ Tavily search client initialized successfully")
+                
+                # Test the client with a simple call
+                try:
+                    test_response = self.tavily_client.search(query="test", max_results=1)
+                    if test_response:
+                        logger.info("✅ Tavily API test successful")
+                    else:
+                        logger.warning("⚠️ Tavily API test returned empty response")
+                except Exception as test_error:
+                    logger.error(f"❌ Tavily API test failed: {test_error}")
+                    # Don't fail initialization, just log the error
+                    
             except ImportError:
                 logger.warning("⚠️ Tavily not available - install with: pip install tavily-python")
+                object.__setattr__(self, 'tavily_client', None)
             except Exception as e:
-                logger.warning(f"⚠️ Tavily initialization failed: {e}")
+                logger.error(f"❌ Tavily initialization failed: {e}")
+                object.__setattr__(self, 'tavily_client', None)
+        else:
+            logger.info("ℹ️ No Tavily API key provided - using free search fallback")
         
         if not self.tavily_client:
-            logger.warning("⚠️ Tavily not available - using free search fallback")
+            logger.info("🔄 Using free search fallback (DuckDuckGo + Wikipedia)")
     
     def _run(self, query: str, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
         """Execute web search using Tavily or free fallback."""
@@ -103,8 +168,6 @@ class EnhancedWebSearchTool(BaseTool):
             logger.error(f"Tavily search error: {e}")
         
         return None
-    
-
     
     def _free_search_fallback(self, query: str) -> str:
         """Fallback search using free APIs."""
