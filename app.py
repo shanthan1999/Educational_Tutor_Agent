@@ -4,8 +4,19 @@ Educational Tutor Agent - Fixed and Optimized Streamlit Application
 Run with: streamlit run app.py --server.fileWatcherType none
 """
 
+# MUST be the first Streamlit command
 import streamlit as st
+
+# Page Configuration - MUST be first
+st.set_page_config(
+    page_title="Educational Tutor Agent",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 import os
+import sys
 import warnings
 from dotenv import load_dotenv
 import logging
@@ -13,28 +24,69 @@ import requests
 import json
 from typing import List, Dict, Any, Optional
 
-# Configure logging
+# Configure logging early
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Optimized compatibility setup
+# Comprehensive compatibility setup to suppress warnings and optimize for deployment
 os.environ.update({
     "TOKENIZERS_PARALLELISM": "false",
-    "OMP_NUM_THREADS": "1"
+    "OMP_NUM_THREADS": "1",
+    "PYTORCH_ENABLE_MPS_FALLBACK": "1",  # Helps with PyTorch compatibility
+    "DISABLE_TELEMETRY": "1",  # Disable telemetry for better compatibility
+    "HF_HUB_DISABLE_TELEMETRY": "1",  # Disable HuggingFace telemetry
+    "TRANSFORMERS_VERBOSITY": "error",  # Reduce transformers verbosity
+    "DATASETS_VERBOSITY": "error",  # Reduce datasets verbosity
+    "TOKENIZERS_PARALLELISM": "false",  # Prevent tokenizer warnings
+    "PYTHONWARNINGS": "ignore",  # Suppress Python warnings
+    "KMP_DUPLICATE_LIB_OK": "TRUE",  # Allow duplicate library loading
 })
-warnings.filterwarnings("ignore")
 
-# Import the real educational agent
+# Comprehensive warning suppression
+warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Suppress torch warnings specifically - more comprehensive
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="datasets.*")
+
+# Suppress faiss warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="faiss.*")
+
+# Additional torch configuration to minimize warnings  
 try:
-    from tutor_agent import setup_educational_agent, setup_web_search_tool
+    import torch
+    if hasattr(torch, '_C') and hasattr(torch._C, '_set_print_stacktraces_on_fatal_signal'):
+        torch._C._set_print_stacktraces_on_fatal_signal(False)
+except:
+    pass
+
+# Import the real educational agent with better error handling
+REAL_AGENT_AVAILABLE = False
+setup_educational_agent = None
+setup_web_search_tool = None
+
+try:
+    # Try importing the real educational agent
+    import tutor_agent
+    setup_educational_agent = tutor_agent.setup_educational_agent
+    setup_web_search_tool = tutor_agent.setup_web_search_tool
     REAL_AGENT_AVAILABLE = True
     logger.info("✅ Real educational agent available")
-except ImportError as e:
-    REAL_AGENT_AVAILABLE = False
+except (ImportError, AttributeError) as e:
     logger.warning(f"⚠️ Real agent not available, using mock: {e}")
+    REAL_AGENT_AVAILABLE = False
+except Exception as e:
+    logger.error(f"❌ Error importing educational agent: {e}")
+    REAL_AGENT_AVAILABLE = False
 
 # Fallback Mock Educational Agent (only used if real agent fails)
 class MockEducationalAgent:
@@ -186,13 +238,7 @@ def setup_fallback_agent():
     """Initialize the fallback educational agent"""
     return MockEducationalAgent()
 
-# Page Configuration
-st.set_page_config(
-    page_title="Educational Tutor Agent",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Page Configuration already set at the top of the file
 
 # Optimized CSS with better mobile responsiveness
 st.markdown("""
@@ -413,7 +459,7 @@ def setup_sidebar():
         
         # Initialize enhanced web search tool
         if not st.session_state.exa_tool:
-            if REAL_AGENT_AVAILABLE:
+            if REAL_AGENT_AVAILABLE and setup_web_search_tool is not None:
                 try:
                     st.session_state.exa_tool = setup_web_search_tool()
                     if st.session_state.exa_tool:
@@ -501,7 +547,7 @@ def setup_sidebar():
         if tavily_key_input:
             if len(tavily_key_input) > 10:
                 try:
-                    if REAL_AGENT_AVAILABLE:
+                    if REAL_AGENT_AVAILABLE and setup_web_search_tool is not None:
                         # Re-initialize with new key
                         os.environ["TAVILY_API_KEY"] = tavily_key_input
                         
@@ -565,7 +611,7 @@ def get_qa_chain():
     try:
         logger.info("Initializing QA chain...")
         
-        if REAL_AGENT_AVAILABLE:
+        if REAL_AGENT_AVAILABLE and setup_educational_agent is not None:
             logger.info("🤖 Using real educational agent with retrieval QA...")
             qa_chain = setup_educational_agent()
         else:
