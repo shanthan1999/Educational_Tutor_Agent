@@ -3,6 +3,7 @@ Enhanced Web Search Module with Tavily Integration
 """
 
 import os
+import sys
 import logging
 from typing import Optional, Dict, Any, List
 from langchain.tools import BaseTool
@@ -41,13 +42,15 @@ def get_tavily_api_key() -> Optional[str]:
     if api_key and api_key.strip() and not api_key.startswith("your_"):
         return api_key.strip()
     
-    # Method 3: Check Streamlit secrets (if available)
+    # Method 3: Check Streamlit secrets (if available) - lazy import to avoid early execution
     try:
-        import streamlit as st
-        if hasattr(st, 'secrets') and 'TAVILY_API_KEY' in st.secrets:
-            api_key = st.secrets['TAVILY_API_KEY']
-            if api_key and api_key.strip() and not api_key.startswith("your_"):
-                return api_key.strip()
+        # Only try to access Streamlit secrets if we're actually running in Streamlit
+        if 'streamlit' in sys.modules:
+            import streamlit as st
+            if hasattr(st, 'secrets') and 'TAVILY_API_KEY' in st.secrets:
+                api_key = st.secrets['TAVILY_API_KEY']
+                if api_key and api_key.strip() and not api_key.startswith("your_"):
+                    return api_key.strip()
     except Exception:
         pass
     
